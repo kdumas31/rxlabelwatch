@@ -1,14 +1,13 @@
 import streamlit as st
 import pandas as pd
-import re
 import io
-import time
-import html
-import requests
-from bs4 import BeautifulSoup
-from rapidfuzz import fuzz
-from datetime import datetime
+import re
+from datetime import date, datetime, timedelta
 import xlsxwriter
+
+import fda_sources as fda
+import pipeline as pl
+from rxlw_core import autodetect_col, highlight_keywords
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -39,267 +38,143 @@ div[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px soli
 </style>
 """, unsafe_allow_html=True)
 
-# ─── NIOSH + USP 800 Keyword Definitions ───────────────────────────────────────
-NIOSH_CRITERIA = {
-    "Carcinogenicity": [
-        "carcinogen", "carcinogenic", "oncogenic", "tumor", "malignant",
-        "cancer", "neoplasm", "carcinoma", "sarcoma", "leukemia", "lymphoma",
-    ],
-    "Genotoxicity": [
-        "genotoxic", "mutagenic", "mutagenicity", "clastogenic",
-        "chromosomal aberration", "dna damage", "ames test", "micronuclei",
-    ],
-    "Reproductive Toxicity": [
-        "teratogenic", "teratogenicity", "embryotoxic", "fetotoxic",
-        "fetal toxicity", "reproductive toxicity", "developmental toxicity",
-        "birth defect", "spermatogenesis", "anovulation", "infertility",
-        "embryo-fetal", "embryofetal",
-    ],
-    "Organ Toxicity": [
-        "organ toxicity", "hepatotoxic", "hepatotoxicity", "nephrotoxic",
-        "nephrotoxicity", "neurotoxic", "neurotoxicity", "cardiotoxic",
-        "cardiotoxicity", "myelosuppression", "myelotoxic", "pulmonary toxicity",
-    ],
-    "Antineoplastic / Cytotoxic": [
-        "antineoplastic", "cytotoxic", "alkylating agent", "antimetabolite",
-        "topoisomerase inhibitor", "mitotic inhibitor", "kinase inhibitor",
-        "immunosuppressant", "monoclonal antibody",
-    ],
-    "Pregnancy / Lactation": [
-        "pregnancy", "lactation", "nursing", "breastfeeding",
-        "fetus", "neonatal", "placental", "embryo", "maternal",
-        "pregnancy category", "avoid pregnancy",
-    ],
-}
 
-USP800_CRITERIA = {
-    "HD Handling Language": [
-        "hazardous drug", "hazardous medication", "hazardous agent",
-        "handling precaution", "safe handling", "special handling",
-        "precautions for handling",
-    ],
-    "PPE Requirements": [
-        "personal protective equipment", "double glov", "chemotherapy gown",
-        "nitrile glove", "protective gown", "respiratory protection",
-        "n95", "respirator", "face shield", "ppe",
-    ],
-    "Engineering Controls": [
-        "closed system", "cstd", "closed-system transfer device",
-        "negative pressure", "ventilated cabinet", "biological safety cabinet",
-        "bsc", "engineering control", "containment", "isolator",
-    ],
-    "Disposal / Spill": [
-        "spill kit", "spill clean", "disposal precaution", "waste disposal",
-        "chemotherapy waste", "hazardous waste", "incinerat",
-    ],
-    "Regulatory References": [
-        "usp 800", "usp800", "niosh", "osha hazard communication",
-        "safety data sheet", "sds", "hazard communication standard",
-    ],
-}
+# ─── Cached FDA access ─────────────────────────────────────────────────────────
+# Failures raise inside the cached function so they are NOT cached; the
+# wrappers turn them back into error results.
+class _NoCache(Exception):
+    def __init__(self, payload):
+        self.payload = payload
 
-BOXED_WARNING_PHRASES = [
-    "boxed warning", "black box warning", "WARNING\n", "WARNINGS\n",
-    "box warning",
-]
 
-SALT_FORMS = [
-    r"\bhydrochloride\b", r"\bhcl\b", r"\bhydrobromide\b", r"\bhbr\b",
-    r"\bsulfate\b", r"\bsulphate\b", r"\bsodium\b", r"\bpotassium\b",
-    r"\bcalcium\b", r"\bmagnesium\b", r"\bacetate\b", r"\bcitrate\b",
-    r"\bphosphate\b", r"\bnitrate\b", r"\bmaleate\b", r"\btartrate\b",
-    r"\bfumarate\b", r"\bsuccinate\b", r"\bmesylate\b", r"\btosylate\b",
-    r"\bbesylate\b", r"\bmalate\b", r"\blactate\b", r"\bgluconate\b",
-    r"\bchloride\b", r"\bbromide\b", r"\biodide\b",
-    r"\bmonohydrate\b", r"\bdihydrate\b", r"\btrihydrate\b",
-]
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cached_srlc_search(date_from: date, date_to: date) -> pd.DataFrame:
+    return fda.search_srlc_by_date(date_from, date_to)
 
-DOSAGE_FORM_WORDS = [
-    "injection", "solution", "tablet", "capsule", "cream", "ointment",
-    "patch", "gel", "suspension", "syrup", "elixir", "suppository",
-    "powder", "lyophilized", "concentrate", "infusion", "emulsion",
-    "oral", "intravenous", "iv", "subcutaneous", "intramuscular",
-    "topical", "ophthalmic", "otic", "nasal", "inhaler", "inhalation",
-    "transdermal", "rectal", "sublingual", "buccal",
-    "extended release", "er", "xr", "cr", "sr", "la", "dr", "ir",
-    "delayed release", "modified release", "immediate release",
-    "ivpb", "piggyback",
-]
 
-DOSAGE_NUM_PATTERN = re.compile(
-    r"\b\d+(\.\d+)?\s*(mg|mcg|g|gram|ml|unit|units|iu|meq|mmol|%)\b",
-    re.IGNORECASE,
-)
-IN_DILUENT_PATTERN = re.compile(
-    r"\bin\s+(dextrose|saline|water|sodium chloride|d5w|ns|lr|lactated|normal saline).*",
-    re.IGNORECASE,
-)
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _cached_srlc_changes(drug_name_id, date_from, date_to, on_date):
+    res = fda.get_srlc_changes(drug_name_id, date_from, date_to, on_date)
+    if res["error"] and not res["records"]:
+        raise _NoCache(res)
+    return res
 
-# ─── Drug Name Normalization ────────────────────────────────────────────────────
-def normalize_drug_name(name: str) -> str:
-    if not isinstance(name, str):
-        return ""
-    n = name.lower().strip()
-    n = DOSAGE_NUM_PATTERN.sub(" ", n)
-    n = IN_DILUENT_PATTERN.sub(" ", n)
-    n = re.sub(r"\(.*?\)", " ", n)
-    for pattern in SALT_FORMS:
-        n = re.sub(pattern, " ", n, flags=re.IGNORECASE)
-    for word in DOSAGE_FORM_WORDS:
-        n = re.sub(r"\b" + re.escape(word) + r"\b", " ", n)
-    n = re.sub(r"[^a-z\s]", " ", n)
-    n = re.sub(r"\s+", " ", n).strip()
-    return n
 
-# ─── Fuzzy Matching ────────────────────────────────────────────────────────────
-def find_best_matches(formulary_norm: str, slrc_norms: list, threshold: int = 78):
-    results = []
-    for i, norm in enumerate(slrc_norms):
-        if not norm:
-            continue
-        score = fuzz.token_sort_ratio(formulary_norm, norm)
-        if score >= threshold:
-            results.append((i, score))
-    results.sort(key=lambda x: -x[1])
-    return results[:5]
-
-# ─── Hazard Analysis ───────────────────────────────────────────────────────────
-def scan_for_hazards(text: str) -> dict:
-    if not text:
-        return {"niosh": {}, "usp800": {}, "boxed_warning": False, "risk_level": "none"}
-    t = text.lower()
-    niosh_hits = {}
-    for category, keywords in NIOSH_CRITERIA.items():
-        hits = [kw for kw in keywords if kw.lower() in t]
-        if hits:
-            niosh_hits[category] = hits
-    usp800_hits = {}
-    for category, keywords in USP800_CRITERIA.items():
-        hits = [kw for kw in keywords if kw.lower() in t]
-        if hits:
-            usp800_hits[category] = hits
-    boxed = any(p.lower() in t for p in BOXED_WARNING_PHRASES)
-    high_signals = [
-        "carcinogen", "genotoxic", "teratogenic", "antineoplastic", "cytotoxic",
-        "hazardous drug", "niosh", "usp 800", "closed system", "cstd",
-        "embryo-fetal", "myelosuppression",
-    ]
-    medium_signals = [
-        "reproductive toxicity", "organ toxicity", "hepatotoxic", "nephrotoxic",
-        "ppe", "personal protective equipment", "disposal precaution",
-        "handling precaution", "pregnancy", "lactation", "mutagenic",
-    ]
-    if boxed or any(s in t for s in high_signals):
-        risk = "high"
-    elif any(s in t for s in medium_signals):
-        risk = "medium"
-    elif niosh_hits or usp800_hits:
-        risk = "low"
-    else:
-        risk = "none"
-    return {"niosh": niosh_hits, "usp800": usp800_hits, "boxed_warning": boxed, "risk_level": risk}
-
-def highlight_keywords(raw_text: str) -> str:
-    escaped = html.escape(raw_text)
-    all_kw = []
-    for kws in NIOSH_CRITERIA.values():
-        for kw in kws:
-            all_kw.append((kw, "hl-niosh"))
-    for kws in USP800_CRITERIA.values():
-        for kw in kws:
-            all_kw.append((kw, "hl-usp800"))
-    all_kw.sort(key=lambda x: -len(x[0]))
-    seen = set()
-    for kw, css in all_kw:
-        if kw.lower() in seen:
-            continue
-        pattern = re.compile(re.escape(kw), re.IGNORECASE)
-        if pattern.search(escaped):
-            escaped = pattern.sub(
-                lambda m: f'<span class="{css}">{m.group()}</span>',
-                escaped,
-            )
-            seen.add(kw.lower())
-    return escaped
-
-# ─── FDA Page Fetcher ──────────────────────────────────────────────────────────
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
-
-PRIORITY_SECTION_KEYWORDS = [
-    "warning", "precaution", "hazard", "handling", "disposal",
-    "pregnancy", "lactation", "reproductive", "carcinogen",
-    "mutageni", "genotoxic", "teratogen", "special handling",
-    "storage and handling", "how supplied",
-]
-
-def fetch_label_page(url: str) -> tuple[str, str]:
-    """Returns (extracted_text, error_message)."""
-    if not url or url in ("None", "nan", ""):
-        return "", "No URL provided"
+def cached_srlc_changes(drug_name_id, date_from=None, date_to=None, on_date=None):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.content, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
-            tag.decompose()
+        return _cached_srlc_changes(drug_name_id, date_from, date_to, on_date)
+    except _NoCache as e:
+        return e.payload
 
-        priority_blocks = []
-        for heading in soup.find_all(["h1", "h2", "h3", "h4", "strong", "b", "p"]):
-            heading_text = heading.get_text(separator=" ").lower()
-            if any(kw in heading_text for kw in PRIORITY_SECTION_KEYWORDS):
-                block = heading.get_text(separator=" ") + "\n"
-                for sib in heading.next_siblings:
-                    if hasattr(sib, "name") and sib.name in ["h1", "h2", "h3", "h4"]:
-                        break
-                    if hasattr(sib, "get_text"):
-                        block += sib.get_text(separator=" ") + "\n"
-                    elif isinstance(sib, str):
-                        block += sib
-                    if len(block) > 2500:
-                        break
-                priority_blocks.append(block[:2500])
 
-        if priority_blocks:
-            text = "\n\n---\n\n".join(priority_blocks[:8])
-        else:
-            text = soup.get_text(separator="\n")
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _cached_openfda(appl_no, appl_type, ingredient, _api_key):
+    res = fda.fetch_openfda_handling(appl_no, appl_type, ingredient, _api_key)
+    if res["error"] and res["error"] != "No openFDA label found":
+        raise _NoCache(res)
+    return res
 
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r" {2,}", " ", text)
-        return text[:8000], ""
-    except requests.exceptions.Timeout:
-        return "", "Request timed out — try Manual Fetch in review."
-    except requests.exceptions.HTTPError as e:
-        return "", f"HTTP {e.response.status_code} — page may require JavaScript or authentication."
-    except Exception as e:
-        return "", f"Fetch error: {str(e)}"
 
-# ─── Column Auto-Detect ────────────────────────────────────────────────────────
-def autodetect_col(df: pd.DataFrame, keywords: list[str]) -> str | None:
-    for kw in keywords:
-        for col in df.columns:
-            if kw.lower() in col.lower():
-                return col
-    return None
+def cached_openfda(appl_no, appl_type, ingredient, api_key=None):
+    try:
+        return _cached_openfda(appl_no, appl_type, ingredient, api_key)
+    except _NoCache as e:
+        return e.payload
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _cached_label_page(url):
+    text, err = fda.fetch_label_page(url)
+    if err:
+        raise _NoCache((text, err))
+    return text, err
+
+
+def cached_label_page(url):
+    try:
+        return _cached_label_page(url)
+    except _NoCache as e:
+        return e.payload
+
+
+FETCHERS = pl.Fetchers(srlc_changes=cached_srlc_changes, openfda=cached_openfda, label_page=cached_label_page)
+
+
+def get_openfda_key():
+    """Optional free openFDA key from .streamlit/secrets.toml or Streamlit Cloud secrets."""
+    try:
+        key = st.secrets.get("OPENFDA_API_KEY", "")
+    except Exception:  # no secrets file at all
+        key = ""
+    return str(key).strip() or None
+
+
+def enrich_kwargs():
+    rng = st.session_state.srlc_range
+    return dict(
+        fetchers=FETCHERS,
+        date_from=rng[0] if rng else None,
+        date_to=rng[1] if rng else None,
+        use_openfda=st.session_state.use_openfda,
+        api_key=get_openfda_key(),
+        include_openfda_in_risk=st.session_state.openfda_in_risk,
+    )
+
+
+def qa_run_info() -> dict:
+    rng = st.session_state.srlc_range
+    sdf = st.session_state.slrc_df
+    matches = st.session_state.matches or []
+    info = {
+        "Generated (local)": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "SrLC source": "FDA SrLC Date Search (fetched by app)" if st.session_state.slrc_source == "fetch" else "Uploaded SrLC export",
+        "Date range": f"{rng[0]:%m/%d/%Y} – {rng[1]:%m/%d/%Y}" if rng else "(uploaded file)",
+        "SrLC search URL": fda.SRLC_SEARCH_URL if rng else "",
+        "SrLC sections searched": ", ".join(fda.SRLC_SECTIONS) if rng else "",
+        "SrLC rows": len(sdf) if sdf is not None else 0,
+        "SrLC fetched at (UTC)": (sdf["fetched_at"].iloc[0] if sdf is not None and "fetched_at" in sdf.columns and len(sdf) else ""),
+        "Formulary drugs": int(st.session_state.formulary_df[st.session_state.f_name_col].nunique()) if st.session_state.formulary_df is not None and st.session_state.f_name_col else "",
+        "Matched pairs": len(matches),
+        "Formulary drugs matched": len({m["formulary_drug"] for m in matches}),
+        "Match threshold": st.session_state.get("last_threshold", ""),
+        "openFDA used": "yes" if st.session_state.use_openfda else "no",
+        "openFDA API key configured": "yes" if get_openfda_key() else "no",
+        "openFDA text counted in overall risk": "yes" if st.session_state.openfda_in_risk else "no",
+        "openFDA scanned fields": ", ".join(fda.OPENFDA_SCAN_FIELDS),
+        "openFDA endpoint": fda.OPENFDA_LABEL_URL,
+    }
+    return info
+
+
+def qa_download_button(key: str):
+    data = pl.build_qa_workbook(st.session_state.slrc_df, st.session_state.matches or [], qa_run_info())
+    st.download_button(
+        "🧾 Download QA Source Data (.xlsx)",
+        data=data,
+        file_name=f"rxlabelwatch_source_data_{datetime.now():%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key=key,
+        help="SrLC results, the per-drug SrLC change text, and openFDA handling text for every match, with source URLs and fetch times.",
+    )
+
 
 # ─── Session State Init ────────────────────────────────────────────────────────
 def init_state():
     defaults = {
         "formulary_df": None,
         "slrc_df": None,
+        "slrc_source": "fetch",
+        "srlc_range": None,
         "f_name_col": None,
         "s_name_col": None,
+        "s_extra_name_col": None,
         "s_url_col": None,
         "s_date_col": None,
         "s_type_col": None,
         "matches": None,
+        "use_openfda": True,
+        "openfda_in_risk": True,
         "ph_decisions": {},
         "ph_notes": {},
     }
@@ -316,8 +191,9 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigate",
-        ["1. Upload Files", "2. Run Matching", "3. Hazard Review", "4. Export"],
+        ["1. Load Data", "2. Run Matching", "3. Hazard Review", "4. Export"],
         label_visibility="collapsed",
+        key="nav",
     )
     st.divider()
     if st.session_state.matches:
@@ -339,14 +215,15 @@ with st.sidebar:
 ⚠ **None** — No hazardous signals detected
 """)
     st.markdown('<div class="section-header">About</div>', unsafe_allow_html=True)
-    st.caption("Matches your Epic formulary to FDA Safety Labeling Changes (SrLC) and scans for NIOSH + USP 800 hazardous drug signals.")
+    st.caption("Matches your Epic formulary to FDA Safety-related Labeling Changes (SrLC), adds current openFDA handling text, and scans for NIOSH + USP 800 hazardous drug signals.")
+    st.caption("openFDA API key: " + ("configured ✓" if get_openfda_key() else "not set (fine for small runs)"))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Page 1 — Upload Files
+# Page 1 — Load Data
 # ═══════════════════════════════════════════════════════════════════════════════
-if page == "1. Upload Files":
-    st.markdown("## 📁 Upload Files")
-    st.caption("Upload your Epic formulary export and the FDA Safety Labeling Changes (SrLC) Excel/CSV file.")
+if page == "1. Load Data":
+    st.markdown("## 📁 Load Data")
+    st.caption("Upload your Epic formulary export, then pull FDA Safety-related Labeling Changes (SrLC) for a date range — or upload an SrLC export.")
 
     col1, col2 = st.columns(2)
 
@@ -361,27 +238,70 @@ if page == "1. Upload Files":
             try:
                 df = pd.read_csv(formulary_file) if formulary_file.name.endswith(".csv") else pd.read_excel(formulary_file)
                 st.session_state.formulary_df = df
-                st.success(f"Loaded **{len(df):,} rows**, {len(df.columns)} columns")
-                st.dataframe(df.head(8), use_container_width=True)
             except Exception as e:
                 st.error(f"Error loading file: {e}")
+        if st.session_state.formulary_df is not None:
+            df = st.session_state.formulary_df
+            st.success(f"Loaded **{len(df):,} rows**, {len(df.columns)} columns")
+            st.dataframe(df.head(8), use_container_width=True)
 
     with col2:
-        st.markdown("### 📋 SrLC Report (from FDA)")
-        st.caption("Download from: [FDA Safety Labeling Changes](https://www.accessdata.fda.gov/scripts/cder/safetylabelingchanges/index.cfm)")
-        slrc_file = st.file_uploader(
-            "Drop your FDA SrLC export here",
-            type=["xlsx", "xls", "csv"],
-            key="slrc_upload",
+        st.markdown("### 📋 FDA Safety Labeling Changes (SrLC)")
+        mode = st.radio(
+            "SrLC source",
+            ["Fetch from FDA (date range)", "Upload SrLC export"],
+            horizontal=True,
+            key="srlc_mode",
         )
-        if slrc_file:
-            try:
-                df = pd.read_csv(slrc_file) if slrc_file.name.endswith(".csv") else pd.read_excel(slrc_file)
-                st.session_state.slrc_df = df
-                st.success(f"Loaded **{len(df):,} rows**, {len(df.columns)} columns")
-                st.dataframe(df.head(8), use_container_width=True)
-            except Exception as e:
-                st.error(f"Error loading file: {e}")
+        if mode == "Fetch from FDA (date range)":
+            today = date.today()
+            rng = st.date_input(
+                "Supplement approval date range",
+                value=(today - timedelta(days=183), today),
+                max_value=today,
+                format="MM/DD/YYYY",
+                key="srlc_dates",
+                help="Searches SrLC's Date Search across all label sections (boxed warning, contraindications, warnings & precautions, adverse reactions, drug interactions, specific populations, patient info).",
+            )
+            if st.button("🔎 Fetch SrLC changes", type="primary", use_container_width=True, key="fetch_srlc"):
+                if not isinstance(rng, (tuple, list)) or len(rng) != 2:
+                    st.error("Pick both a start and an end date.")
+                else:
+                    d_from, d_to = rng
+                    with st.spinner(f"Searching FDA SrLC {d_from:%m/%d/%Y} – {d_to:%m/%d/%Y}…"):
+                        try:
+                            sdf = cached_srlc_search(d_from, d_to)
+                            st.session_state.slrc_df = sdf
+                            st.session_state.slrc_source = "fetch"
+                            st.session_state.srlc_range = (d_from, d_to)
+                            st.session_state.matches = None
+                        except fda.FDAError as e:
+                            st.error(f"FDA SrLC search failed: {e}  You can still upload an SrLC export instead.")
+            st.caption("Source: [FDA SrLC database](https://www.accessdata.fda.gov/scripts/cder/safetylabelingchanges/index.cfm)")
+        else:
+            st.caption("Backup path. Download from: [FDA Safety Labeling Changes](https://www.accessdata.fda.gov/scripts/cder/safetylabelingchanges/index.cfm)")
+            slrc_file = st.file_uploader(
+                "Drop your FDA SrLC export here",
+                type=["xlsx", "xls", "csv"],
+                key="slrc_upload",
+            )
+            if slrc_file:
+                try:
+                    df = pd.read_csv(slrc_file) if slrc_file.name.endswith(".csv") else pd.read_excel(slrc_file)
+                    st.session_state.slrc_df = df
+                    st.session_state.slrc_source = "upload"
+                    st.session_state.srlc_range = None
+                except Exception as e:
+                    st.error(f"Error loading file: {e}")
+
+        if st.session_state.slrc_df is not None:
+            sdf = st.session_state.slrc_df
+            if st.session_state.slrc_source == "fetch" and st.session_state.srlc_range:
+                r0, r1 = st.session_state.srlc_range
+                st.success(f"Fetched **{len(sdf):,} SrLC rows** for {r0:%m/%d/%Y} – {r1:%m/%d/%Y}")
+            else:
+                st.success(f"Loaded **{len(sdf):,} rows**, {len(sdf.columns)} columns")
+            st.dataframe(sdf.drop(columns=[c for c in ("fetched_at", "source_url") if c in sdf.columns]).head(8), use_container_width=True)
 
     if st.session_state.formulary_df is not None and st.session_state.slrc_df is not None:
         st.divider()
@@ -391,14 +311,22 @@ if page == "1. Upload Files":
         fdf = st.session_state.formulary_df
         sdf = st.session_state.slrc_df
         fcols = list(fdf.columns)
-        scols = list(sdf.columns)
+        scols = [c for c in sdf.columns if c not in ("fetched_at", "source_url")]
+        fetched = st.session_state.slrc_source == "fetch"
+        sdf_map = sdf[scols]  # don't auto-detect our provenance columns
 
         # Auto-detect defaults
         f_name_default = autodetect_col(fdf, ["drug", "name", "generic", "description", "medication", "item", "title"]) or fcols[0]
-        s_name_default = autodetect_col(sdf, ["drug", "name", "proprietary", "nonproprietary", "generic", "product"]) or scols[0]
-        s_url_default = autodetect_col(sdf, ["url", "link", "href", "web", "labeling"])
-        s_date_default = autodetect_col(sdf, ["date", "submission", "approval", "effective"])
-        s_type_default = autodetect_col(sdf, ["type", "supplement", "change", "category", "description"])
+        if fetched and "Active Ingredient" in scols:
+            # Formularies list generics; SrLC 'Drug Name' is usually the brand.
+            s_name_default = "Active Ingredient"
+            s_extra_default = "Drug Name"
+        else:
+            s_name_default = autodetect_col(sdf_map, ["drug", "name", "proprietary", "nonproprietary", "generic", "product"]) or scols[0]
+            s_extra_default = None
+        s_url_default = autodetect_col(sdf_map, ["url", "link", "href", "web", "labeling"])
+        s_date_default = autodetect_col(sdf_map, ["supplement date", "date", "submission", "approval", "effective"])
+        s_type_default = None if fetched else autodetect_col(sdf_map, ["type", "supplement", "change", "category", "description"])
 
         c1, c2 = st.columns(2)
         with c1:
@@ -410,25 +338,32 @@ if page == "1. Upload Files":
             )
 
         with c2:
-            st.markdown("**SrLC File**")
+            st.markdown("**SrLC Data**")
             ca, cb = st.columns(2)
             st.session_state.s_name_col = ca.selectbox(
                 "Drug name column", scols,
-                index=scols.index(s_name_default),
+                index=scols.index(s_name_default) if s_name_default in scols else 0,
             )
+            extra_opts = ["(none)"] + scols
+            s_extra_sel = cb.selectbox(
+                "Also match on", extra_opts,
+                index=extra_opts.index(s_extra_default) if s_extra_default in extra_opts else 0,
+                help="Optional second SrLC name column (e.g. brand 'Drug Name').",
+            )
+            st.session_state.s_extra_name_col = None if s_extra_sel == "(none)" else s_extra_sel
             url_opts = ["(none)"] + scols
             s_url_idx = url_opts.index(s_url_default) if s_url_default in url_opts else 0
-            s_url_sel = cb.selectbox("URL / link column", url_opts, index=s_url_idx)
+            s_url_sel = ca.selectbox("URL / link column", url_opts, index=s_url_idx)
             st.session_state.s_url_col = None if s_url_sel == "(none)" else s_url_sel
 
             date_opts = ["(none)"] + scols
             s_date_idx = date_opts.index(s_date_default) if s_date_default in date_opts else 0
-            s_date_sel = ca.selectbox("Date column", date_opts, index=s_date_idx)
+            s_date_sel = cb.selectbox("Date column", date_opts, index=s_date_idx)
             st.session_state.s_date_col = None if s_date_sel == "(none)" else s_date_sel
 
             type_opts = ["(none)"] + scols
             s_type_idx = type_opts.index(s_type_default) if s_type_default in type_opts else 0
-            s_type_sel = cb.selectbox("Change type column", type_opts, index=s_type_idx)
+            s_type_sel = ca.selectbox("Change type column", type_opts, index=s_type_idx)
             st.session_state.s_type_col = None if s_type_sel == "(none)" else s_type_sel
 
         st.info("✅ Column mapping set. Go to **2. Run Matching** to find matches.")
@@ -440,7 +375,7 @@ elif page == "2. Run Matching":
     st.markdown("## 🔍 Run Matching")
 
     if st.session_state.formulary_df is None or st.session_state.slrc_df is None:
-        st.warning("Please upload both files in Step 1 first.")
+        st.warning("Load the formulary and SrLC data in Step 1 first.")
         st.stop()
 
     c1, c2 = st.columns([2, 1])
@@ -450,9 +385,19 @@ elif page == "2. Run Matching":
         help="78 is a good default. Lower to catch more matches (more false positives); raise for stricter matching.",
     )
     fetch_pages = c2.toggle(
-        "Auto-fetch FDA label pages",
+        "Auto-fetch FDA change details",
         value=True,
-        help="Fetches and analyzes the FDA labeling change page for each match. Adds ~1–2 sec per match.",
+        help="Downloads each match's SrLC change data (CSV) and scans it. ~1 sec per match; cached for 24 h.",
+    )
+    st.session_state.use_openfda = c2.toggle(
+        "Add openFDA handling text",
+        value=st.session_state.use_openfda,
+        help="Pulls the current label's How Supplied, Storage & Handling, References, Carcinogenesis, Pregnancy, Lactation and Reproductive Potential sections (SrLC doesn't track these).",
+    )
+    st.session_state.openfda_in_risk = c2.toggle(
+        "Count openFDA text in risk level",
+        value=st.session_state.openfda_in_risk,
+        help="When off, the risk level reflects only the SrLC change text; openFDA hits are still listed by source.",
     )
 
     with st.expander("ℹ️ How matching works"):
@@ -464,72 +409,40 @@ The app normalizes drug names on both sides before matching:
 - Removes EPIC IV bag diluent phrases ("in dextrose 5% in water")
 
 Then uses **token sort ratio** fuzzy matching — so "VANCOMYCIN HYDROCHLORIDE" and "vancomycin HCl 1g IVPB" will match correctly.
+
+For each match, the app downloads SrLC's per-drug **Download Data** CSV and keeps only the supplements approved in your date range,
+then looks up the current label on **openFDA** (by application number, falling back to generic name). Each flag shows which source triggered it.
 """)
 
-    if st.button("▶ Run Matching", use_container_width=True, type="primary"):
+    if st.button("▶ Run Matching", use_container_width=True, type="primary", key="run_matching"):
         fdf = st.session_state.formulary_df
         sdf = st.session_state.slrc_df
         f_col = st.session_state.f_name_col or fdf.columns[0]
         s_col = st.session_state.s_name_col or sdf.columns[0]
-
-        formulary_drugs = fdf[f_col].dropna().astype(str).unique().tolist()
-        slrc_names = sdf[s_col].fillna("").astype(str).tolist()
-        slrc_norms = [normalize_drug_name(d) for d in slrc_names]
+        st.session_state.last_threshold = threshold
 
         progress = st.progress(0, text="Normalizing and matching…")
-        matches = []
-
-        for i, drug in enumerate(formulary_drugs):
-            progress.progress((i + 1) / len(formulary_drugs), text=f"Matching: {drug[:60]}")
-            drug_norm = normalize_drug_name(drug)
-            if not drug_norm:
-                continue
-            best = find_best_matches(drug_norm, slrc_norms, threshold=threshold)
-            for idx, score in best:
-                row = sdf.iloc[idx]
-                url = str(row[st.session_state.s_url_col]) if st.session_state.s_url_col else ""
-                date_val = str(row[st.session_state.s_date_col]) if st.session_state.s_date_col else ""
-                change_type = str(row[st.session_state.s_type_col]) if st.session_state.s_type_col else ""
-                matches.append({
-                    "formulary_drug": drug,
-                    "slrc_drug": slrc_names[idx],
-                    "match_score": score,
-                    "date": date_val,
-                    "change_type": change_type,
-                    "url": url if url not in ("", "None", "nan") else "",
-                    "label_text": "",
-                    "fetch_error": "",
-                    "risk_level": "none",
-                    "niosh": {},
-                    "usp800": {},
-                    "boxed_warning": False,
-                })
-
-        progress.progress(1.0, text=f"Matched {len(matches)} drug–label pairs.")
+        matches = pl.run_matching(
+            fdf, f_col, sdf, s_col,
+            st.session_state.s_url_col, st.session_state.s_date_col, st.session_state.s_type_col,
+            threshold=threshold,
+            extra_name_col=st.session_state.s_extra_name_col,
+            progress=lambda p, t: progress.progress(p, text=t),
+        )
         st.session_state.matches = matches
 
-        # Auto-fetch FDA pages
         if fetch_pages and matches:
-            urls = [(i, m) for i, m in enumerate(matches) if m["url"]]
-            if urls:
-                fp = st.progress(0, text="Fetching FDA label pages…")
-                for j, (i, m) in enumerate(urls):
-                    fp.progress((j + 1) / len(urls), text=f"Fetching: {m['slrc_drug'][:60]}")
-                    text, err = fetch_label_page(m["url"])
-                    matches[i]["label_text"] = text
-                    matches[i]["fetch_error"] = err
-                    if text:
-                        findings = scan_for_hazards(text)
-                        matches[i]["risk_level"] = findings["risk_level"]
-                        matches[i]["niosh"] = findings["niosh"]
-                        matches[i]["usp800"] = findings["usp800"]
-                        matches[i]["boxed_warning"] = findings["boxed_warning"]
-                    time.sleep(0.4)
-                fp.empty()
+            fp = st.progress(0, text="Fetching FDA change details…")
+            pl.enrich_all(matches, progress=lambda p, t: fp.progress(p, text=t), **enrich_kwargs())
+            fp.empty()
+            n_err = sum(1 for m in matches if m["fetch_error"])
+            if n_err:
+                st.warning(f"{n_err} match(es) had a fetch issue — see Hazard Review for details.")
 
         st.success(f"**{len(matches)} matches** found across {len(set(m['formulary_drug'] for m in matches))} formulary drugs.")
 
-        # Preview table
+    if st.session_state.matches:
+        matches = st.session_state.matches
         preview = pd.DataFrame([{
             "Formulary Drug": m["formulary_drug"],
             "SrLC Match": m["slrc_drug"],
@@ -537,8 +450,12 @@ Then uses **token sort ratio** fuzzy matching — so "VANCOMYCIN HYDROCHLORIDE" 
             "Date": m["date"],
             "Change Type": m["change_type"],
             "Risk": m["risk_level"].upper(),
+            "SrLC Risk": m.get("risk_by_source", {}).get(pl.SRC_SRLC, m.get("risk_by_source", {}).get(pl.SRC_SRLC_PAGE, "")).upper(),
+            "openFDA Risk": m.get("risk_by_source", {}).get(pl.SRC_OPENFDA, "").upper(),
+            "Flags (source)": "; ".join(f"{lab} [{', '.join(s.split(' ')[0] for s in srcs)}]" for lab, srcs in m.get("flag_sources", {}).items()),
         } for m in matches])
         st.dataframe(preview, use_container_width=True)
+        qa_download_button("qa_dl_page2")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Page 3 — Hazard Review
@@ -587,21 +504,22 @@ elif page == "3. Hazard Review":
         "Escalate — Send to P&T committee",
     ]
 
-    for match in filtered:
+    for mi, match in enumerate(filtered):
         drug = match["formulary_drug"]
+        wkey = f"{drug}_{match.get('slrc_row', mi)}"
         risk = match["risk_level"]
         icon = RISK_ICONS.get(risk, "⚪")
         reviewed_mark = "✅ " if drug in st.session_state.ph_decisions else ""
-        label = f"{icon} {reviewed_mark}{drug}  ←  {match['slrc_drug']}  [{match['match_score']}% match]"
+        label = f"{icon} {reviewed_mark}{drug}  ←  {match['slrc_drug']}  [{match['match_score']:.0f}% match]"
         if match.get("date"):
             label += f"  ·  {match['date']}"
 
         with st.expander(label, expanded=(risk == "high" and drug not in st.session_state.ph_decisions)):
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Risk Level", risk.upper())
-            m2.metric("Match Score", f"{match['match_score']}%")
+            m2.metric("Match Score", f"{match['match_score']:.0f}%")
             m3.metric("Change Date", match.get("date") or "—")
-            m4.metric("Change Type", (match.get("change_type") or "—")[:30])
+            m4.metric("Change Type", (match.get("change_type") or match.get("appl_type") or "—")[:30])
 
             # Tags
             tags = ""
@@ -613,6 +531,11 @@ elif page == "3. Hazard Review":
                 tags += f'<span class="tag usp800">USP 800: {cat}</span>'
             if tags:
                 st.markdown(tags + "<br>", unsafe_allow_html=True)
+            if match.get("flag_sources"):
+                st.markdown("**Flag sources:** " + " · ".join(
+                    f"{lab} — _{', '.join(srcs)}_" for lab, srcs in match["flag_sources"].items()))
+            if match.get("risk_by_source"):
+                st.caption("Risk by source: " + " · ".join(f"{s}: {r.upper()}" for s, r in match["risk_by_source"].items()))
 
             col_label, col_review = st.columns([3, 2])
 
@@ -621,42 +544,24 @@ elif page == "3. Hazard Review":
                     st.markdown(f"[🔗 Open FDA Labeling Change Page]({match['url']})")
 
                 if match.get("label_text"):
-                    with st.expander("📄 Extracted Label Content (keyword-highlighted)", expanded=(risk in ["high", "medium"])):
+                    with st.expander(f"📄 {match.get('text_source') or 'SrLC change text'} (keyword-highlighted)", expanded=(risk in ["high", "medium"])):
                         highlighted = highlight_keywords(match["label_text"][:4000])
                         st.markdown(
                             f'<div class="label-block">{highlighted}</div>',
                             unsafe_allow_html=True,
                         )
-                elif match.get("fetch_error"):
-                    st.warning(f"Auto-fetch failed: {match['fetch_error']}")
-                    if match.get("url") and st.button("🔄 Retry Fetch", key=f"retry_{drug}"):
+                if match.get("openfda_text"):
+                    o = match.get("openfda", {})
+                    with st.expander(f"🏷️ openFDA current label — {o.get('brand_name', '')} ({o.get('effective_time', '')})"):
+                        highlighted = highlight_keywords(match["openfda_text"][:4000])
+                        st.markdown(f'<div class="label-block">{highlighted}</div>', unsafe_allow_html=True)
+                if match.get("fetch_error"):
+                    st.warning(f"Fetch issue: {match['fetch_error']}")
+                if match.get("drug_name_id") or match.get("url"):
+                    btn = "🔄 Retry Fetch" if (match.get("fetch_error") or match.get("label_text")) else "Fetch FDA Data Now"
+                    if st.button(btn, key=f"fetch_{wkey}"):
                         with st.spinner("Fetching…"):
-                            text, err = fetch_label_page(match["url"])
-                        match["label_text"] = text
-                        match["fetch_error"] = err
-                        if text:
-                            findings = scan_for_hazards(text)
-                            match.update({
-                                "risk_level": findings["risk_level"],
-                                "niosh": findings["niosh"],
-                                "usp800": findings["usp800"],
-                                "boxed_warning": findings["boxed_warning"],
-                            })
-                        st.rerun()
-                elif match.get("url"):
-                    if st.button("Fetch Label Page Now", key=f"fetch_{drug}"):
-                        with st.spinner("Fetching…"):
-                            text, err = fetch_label_page(match["url"])
-                        match["label_text"] = text
-                        match["fetch_error"] = err
-                        if text:
-                            findings = scan_for_hazards(text)
-                            match.update({
-                                "risk_level": findings["risk_level"],
-                                "niosh": findings["niosh"],
-                                "usp800": findings["usp800"],
-                                "boxed_warning": findings["boxed_warning"],
-                            })
+                            pl.enrich_match(match, **enrich_kwargs())
                         st.rerun()
                 else:
                     st.caption("No URL available — review the FDA SrLC page manually.")
@@ -669,7 +574,7 @@ elif page == "3. Hazard Review":
                     "Decision",
                     DECISION_OPTIONS,
                     index=dec_idx,
-                    key=f"dec_{drug}",
+                    key=f"dec_{wkey}",
                     label_visibility="collapsed",
                 )
                 notes = st.text_area(
@@ -677,9 +582,9 @@ elif page == "3. Hazard Review":
                     value=st.session_state.ph_notes.get(drug, ""),
                     placeholder="Clinical rationale, follow-up actions, P&T notes…",
                     height=110,
-                    key=f"notes_{drug}",
+                    key=f"notes_{wkey}",
                 )
-                if st.button("Save Review", key=f"save_{drug}", use_container_width=True):
+                if st.button("Save Review", key=f"save_{wkey}", use_container_width=True):
                     if decision:
                         st.session_state.ph_decisions[drug] = decision
                     if notes:
@@ -731,6 +636,7 @@ elif page == "4. Export":
         "Change Date", "Change Type", "Risk Level",
         "Boxed Warning", "NIOSH Signals", "USP 800 Signals",
         "FDA URL", "Pharmacist Decision", "Clinical Notes",
+        "Flag Sources",
     ]
 
     def write_sheet(ws, data, show_url=True):
@@ -761,6 +667,7 @@ elif page == "4. Export":
                 m.get("url") or "",
                 st.session_state.ph_decisions.get(drug, "Pending Review"),
                 st.session_state.ph_notes.get(drug, ""),
+                "; ".join(f"{lab} [{', '.join(srcs)}]" for lab, srcs in m.get("flag_sources", {}).items()),
             ]
             for c, val in enumerate(row_vals):
                 if c == 9 and val and val.startswith("http"):
@@ -774,6 +681,7 @@ elif page == "4. Export":
         ws.set_column(7, 8, 55)
         ws.set_column(9, 9, 45)
         ws.set_column(10, 11, 40)
+        ws.set_column(12, 12, 60)
         ws.freeze_panes(1, 0)
 
     # Sheet 1: All matches
@@ -822,6 +730,8 @@ elif page == "4. Export":
         use_container_width=True,
         type="primary",
     )
+    qa_download_button("qa_dl_page4")
+    st.caption("The QA file holds the raw source data behind every flag (SrLC rows, SrLC change text, openFDA label text) with source URLs and fetch times — check it before sharing results with clients.")
 
     st.markdown("### Preview — All Matches")
     prev_df = pd.DataFrame([{
