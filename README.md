@@ -38,11 +38,25 @@ may affect hazardous-drug handling (NIOSH criteria and USP 800 language).
    `carcinogen` still match *carcinogenicity*. Short acronyms such as `ppe`,
    `bsc`, `sds`, `cstd`, `n95`, `niosh`, and `usp 800` (plus `respirator`)
    must match as whole words. Highlighting follows the same rule.
+   **Negation:** a mention negated in its own clause doesn't raise the risk
+   level. That covers a negation cue up to 6 words before the term ("no
+   evidence of carcinogenicity", "was not teratogenic", "non-mutagenic",
+   "negative in the Ames ... assay") and a cue after it ("results were
+   negative", "was not observed"). The mention still counts if the clause
+   has an affirmative cue such as "may cause", "risk of", "associated with",
+   or "was positive". Clauses end at `. ; : ! ?`, a newline, and words like
+   *but*, *however*, and *although*. Instructions and missing-data phrases
+   ("do not use", "not recommended", "not been established", "no adequate
+   studies") aren't treated as negation. A keyword counts if any one of its
+   mentions isn't negated. Negated mentions are never dropped: they show as
+   struck-through grey tags and highlights, they're listed in a *Negated
+   mentions* table, and they go to a **Negated Hits** sheet in the QA file.
+   "Risk Ignoring Negation" shows the level the old scan would have given.
 6. **Review and export.** Record pharmacist decisions, then download:
    - the **report** (`.xlsx`: All Matches, High Risk, Action Required, P&T
      Summary), and
    - the **QA source data** (`.xlsx`: Run Info, SrLC Results, Matches, SrLC
-     Change Text, openFDA Handling), with source URLs and fetch timestamps.
+     Change Text, openFDA Handling, Negated Hits), with source URLs and fetch timestamps.
      Use it to check the raw data before you share results.
 
 ## Run locally
@@ -73,8 +87,9 @@ The app runs fine without a key, and the key is never written to the exports.
 
 ## Tests
 
-`python tests/test_core.py` runs offline checks of the keyword rule and the
-near-miss drug pairs.
+`python tests/test_core.py` runs offline checks of the keyword rule, the
+near-miss drug pairs, and negation, using real-style label sentences, both
+negated and affirmed.
 
 ## Data sources
 
@@ -90,10 +105,11 @@ hours. The app waits about 0.4 seconds between FDA calls.
 
 ## Limitations
 
-- The hazard scan is keyword-based and doesn't read context, so phrases like
-  "no evidence of carcinogenicity" still trigger a flag. openFDA's
-  carcinogenesis and pregnancy sections exist on almost every label, which is
-  why openFDA text is left out of the risk level by default.
+- The hazard scan is keyword-based. Negation handling is a simple rule
+  (see above), not a full sentence parse. Section headings such as
+  "Carcinogenesis, Mutagenesis, Impairment of Fertility" and "Pregnancy"
+  count as mentions, so openFDA text still rates almost every label HIGH.
+  That's why openFDA text is left out of the risk level by default.
 - Some products, such as Thalomid, have no openFDA label. Their flags come
   from SrLC only.
 - FDA's Download Data CSV isn't strictly valid CSV, because it contains

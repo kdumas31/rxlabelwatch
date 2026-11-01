@@ -30,9 +30,11 @@ div[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px soli
 .tag { display: inline-block; background: #21262d; border: 1px solid #30363d; border-radius: 4px; padding: 2px 8px; font-size: 0.72rem; font-family: 'IBM Plex Mono', monospace; margin-right: 4px; color: #8b949e; }
 .tag.niosh { background: #3d1f1f; border-color: #f85149; color: #f85149; }
 .tag.usp800 { background: #2d2000; border-color: #d29922; color: #d29922; }
+.tag.negated { background: #161b22; border-style: dashed; color: #8b949e; text-decoration: line-through; }
 .tag.boxed { background: #1f0a0a; border-color: #ff7b72; color: #ff7b72; font-weight: 600; }
 .hl-niosh { background: rgba(248,81,73,0.25); border-radius: 3px; padding: 1px 3px; font-weight: 600; }
 .hl-usp800 { background: rgba(210,153,34,0.25); border-radius: 3px; padding: 1px 3px; font-weight: 600; }
+.hl-negated { background: rgba(139,148,158,0.18) !important; font-weight: 400 !important; text-decoration: line-through dotted; opacity: 0.85; }
 .section-header { font-family: 'IBM Plex Mono', monospace; font-size: 0.75rem; color: #8b949e; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 0.25rem; }
 .label-block { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 12px 16px; font-size: 0.83rem; line-height: 1.7; white-space: pre-wrap; color: #c9d1d9; max-height: 400px; overflow-y: auto; }
 </style>
@@ -539,6 +541,10 @@ elif page == "3. Hazard Review":
                 tags += f'<span class="tag niosh">NIOSH: {cat}</span>'
             for cat in match.get("usp800", {}):
                 tags += f'<span class="tag usp800">USP 800: {cat}</span>'
+            neg = match.get("negated") or {}
+            for key, lab in (("niosh", "NIOSH"), ("usp800", "USP 800")):
+                for cat in neg.get(key, {}):
+                    tags += f'<span class="tag negated" title="All mentions negated; not counted in risk">{lab}: {cat} (negated)</span>'
             if tags:
                 st.markdown(tags + "<br>", unsafe_allow_html=True)
             if match.get("flag_sources"):
@@ -546,6 +552,15 @@ elif page == "3. Hazard Review":
                 st.markdown("**Flag sources:** " + " · ".join(
                     f"{lab} — _{', '.join(s + (ctx if s == pl.SRC_OPENFDA else '') for s in srcs)}_"
                     for lab, srcs in match["flag_sources"].items()))
+            if match.get("negated_by_source"):
+                n_neg = sum(len(v) for v in match["negated_by_source"].values())
+                if match.get("risk_level_ignoring_negation", risk) != risk:
+                    st.caption(f"Risk would be {match['risk_level_ignoring_negation'].upper()} if negated mentions were counted.")
+                with st.expander(f"🚫 Negated mentions — not counted in risk ({n_neg})"):
+                    st.dataframe(pd.DataFrame([
+                        {"Source": src, "Category": e["category"], "Keyword": e["keyword"], "Clause": e["clause"]}
+                        for src, ev in match["negated_by_source"].items() for e in ev
+                    ]), width="stretch", hide_index=True)
             if match.get("risk_by_source"):
                 st.caption("Risk by source: " + " · ".join(f"{s}: {r.upper()}" for s, r in match["risk_by_source"].items()))
 
@@ -648,7 +663,7 @@ elif page == "4. Export":
         "Change Date", "Change Type", "Risk Level",
         "Boxed Warning", "NIOSH Signals", "USP 800 Signals",
         "FDA URL", "Pharmacist Decision", "Clinical Notes",
-        "Flag Sources",
+        "Flag Sources", "Negated Signals (not in risk)",
     ]
 
     def write_sheet(ws, data, show_url=True):
@@ -680,6 +695,7 @@ elif page == "4. Export":
                 st.session_state.ph_decisions.get(drug, "Pending Review"),
                 st.session_state.ph_notes.get(drug, ""),
                 "; ".join(f"{lab} [{', '.join(srcs)}]" for lab, srcs in m.get("flag_sources", {}).items()),
+                "; ".join(f"{cat}: {', '.join(kws)}" for d in (m.get("negated") or {}).values() for cat, kws in d.items()),
             ]
             for c, val in enumerate(row_vals):
                 if c == 9 and val and val.startswith("http"):
@@ -694,6 +710,7 @@ elif page == "4. Export":
         ws.set_column(9, 9, 45)
         ws.set_column(10, 11, 40)
         ws.set_column(12, 12, 60)
+        ws.set_column(13, 13, 50)
         ws.freeze_panes(1, 0)
 
     # Sheet 1: All matches
