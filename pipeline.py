@@ -122,6 +122,9 @@ def run_matching(
                 "niosh": {},
                 "usp800": {},
                 "boxed_warning": False,
+                "negated": {"niosh": {}, "usp800": {}},
+                "negated_by_source": {},
+                "risk_level_ignoring_negation": "none",
             })
     if progress:
         progress(1.0, f"Matched {len(matches)} drug–label pairs.")
@@ -134,6 +137,12 @@ def _flag_labels(findings: dict) -> list[str]:
     labels += [f"NIOSH: {c}" for c in findings["niosh"]]
     labels += [f"USP 800: {c}" for c in findings["usp800"]]
     return labels
+
+
+def _negated_labels(findings: dict) -> list[str]:
+    neg = findings.get("negated", {})
+    return ([f"NIOSH: {c} (negated)" for c in neg.get("niosh", {})]
+            + [f"USP 800: {c} (negated)" for c in neg.get("usp800", {})])
 
 
 def apply_scan(m: dict, include_openfda_in_risk: bool = False) -> None:
@@ -154,11 +163,14 @@ def apply_scan(m: dict, include_openfda_in_risk: bool = False) -> None:
     m["niosh"] = combined["niosh"]
     m["usp800"] = combined["usp800"]
     m["boxed_warning"] = combined["boxed_warning"]
+    m["negated"] = combined["negated"]
+    m["risk_level_ignoring_negation"] = combined["risk_level_ignoring_negation"]
+    m["negated_by_source"] = {src: f["negated_evidence"] for src, f in per_source.items() if f["negated_evidence"]}
     m["risk_by_source"] = {src: f["risk_level"] for src, f in per_source.items()}
     m["openfda_in_risk"] = include_openfda_in_risk
     flag_sources: dict[str, list[str]] = {}
     for src, f in per_source.items():
-        for lab in _flag_labels(f):
+        for lab in _flag_labels(f) + _negated_labels(f):
             flag_sources.setdefault(lab, []).append(src)
     m["flag_sources"] = flag_sources
 
@@ -234,7 +246,7 @@ def _trim(v):
 
 def build_qa_workbook(slrc_df: pd.DataFrame | None, matches: list[dict], run_info: dict) -> bytes:
     """xlsx with every source record behind the flags, for QA before sharing."""
-    match_rows, change_rows, ofda_rows = [], [], []
+    match_rows, change_rows, ofda_rows, neg_rows = [], [], [], []
     for m in matches:
         o = m.get("openfda") or {}
         match_rows.append({
@@ -250,12 +262,23 @@ def build_qa_workbook(slrc_df: pd.DataFrame | None, matches: list[dict], run_inf
             "openFDA Counted in Risk": "yes" if m.get("openfda_in_risk") else "no (context only)",
             "NIOSH Signals": _fmt_hits(m.get("niosh", {})), "USP 800 Signals": _fmt_hits(m.get("usp800", {})),
             "Boxed Warning": "YES" if m.get("boxed_warning") else "",
+            "Negated Signals (not in risk)": "; ".join(
+                f"{c}: {', '.join(k)}" for d in (m.get("negated") or {}).values() for c, k in d.items()),
+            "Risk Ignoring Negation": (m.get("risk_level_ignoring_negation") or "").upper(),
             "SrLC Text Source": m.get("text_source", ""), "SrLC Change Rows": len(m.get("srlc_records", [])),
             "openFDA Label": o.get("brand_name", "") + (f" ({o.get('effective_time')})" if o.get("effective_time") else ""),
             "Errors": m.get("fetch_error", ""),
             "SrLC Detail URL": m.get("url", ""), "SrLC CSV URL": m.get("srlc_csv_url", ""),
             "openFDA Query URL": o.get("query_url", ""),
         })
+        for src, ev in (m.get("negated_by_source") or {}).items():
+            for e in ev:
+                neg_rows.append({
+                    "Formulary Drug": m["formulary_drug"], "SrLC Drug": m["slrc_drug"],
+                    "DrugNameID": m.get("drug_name_id", ""), "Source": src,
+                    "Counted in Risk Level": "no (negated)",
+                    "Category": e["category"], "Keyword": e["keyword"], "Negated Clause": e["clause"],
+                })
         for r in m.get("srlc_records", []):
             change_rows.append({
                 "Formulary Drug": m["formulary_drug"], "SrLC Drug": r.get("drug_name", m["slrc_drug"]),
@@ -295,6 +318,9 @@ def build_qa_workbook(slrc_df: pd.DataFrame | None, matches: list[dict], run_inf
         "Matches": pd.DataFrame(match_rows),
         "SrLC Change Text": pd.DataFrame(change_rows),
         "openFDA Handling": pd.DataFrame(ofda_rows),
+        "Negated Hits": pd.DataFrame(neg_rows, columns=[
+            "Formulary Drug", "SrLC Drug", "DrugNameID", "Source", "Counted in Risk Level",
+            "Category", "Keyword", "Negated Clause"]),
     }
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_urls": False}}) as xw:
@@ -307,6 +333,6 @@ def build_qa_workbook(slrc_df: pd.DataFrame | None, matches: list[dict], run_inf
             ws = xw.sheets[name]
             ws.freeze_panes(1, 0)
             for ci, c in enumerate(df.columns):
-                width = 80 if c in ("Changed Text", "Text", "Value") else min(max(len(str(c)) + 2, 14), 45)
+                width = 80 if c in ("Changed Text", "Text", "Value", "Negated Clause") else min(max(len(str(c)) + 2, 14), 45)
                 ws.set_column(ci, ci, width)
     return buf.getvalue()
