@@ -14,8 +14,13 @@ may affect hazardous-drug handling (NIOSH criteria and USP 800 language).
      the SrLC site.
 2. **Crosswalk.** Drug names are normalized (salts, dosage forms, strengths,
    and diluents are stripped) and fuzzy-matched (`rapidfuzz` token sort ratio,
-   default threshold 78). For fetched data, the app matches on
-   *Active Ingredient* and also on *Drug Name* (the brand).
+   default threshold 78). Each fuzzy hit must also pass an ingredient-level
+   check: every word of the shorter name has to appear in the other name,
+   either exactly or as a near-identical spelling (90% similar or more). This
+   rejects look-alike generics like amoxicillin/oxacillin and
+   prednisone/prednisolone. For fetched data, the app matches on *Active
+   Ingredient* and also on *Drug Name* (the brand), and keeps every matching
+   label in range. The per-drug limit is adjustable, and 0 means no limit.
 3. **Change details.** For each match, the app downloads SrLC's per-drug
    **Download Data** CSV and keeps only the supplements approved in your date
    range (dates come from the drug's SrLC detail page). If the CSV isn't
@@ -25,10 +30,14 @@ may affect hazardous-drug handling (NIOSH criteria and USP 800 language).
    Storage & Handling, References, Carcinogenesis/Mutagenesis/Fertility,
    Pregnancy, Lactation, and Females & Males of Reproductive Potential
    sections. SrLC doesn't track handling sections, so this fills that gap.
-5. **Hazard scan.** The same NIOSH/USP 800 keyword scan runs on the SrLC
-   change text and the openFDA text. Each flag shows which source triggered
-   it, and you can choose whether openFDA text counts toward the overall risk
-   level.
+5. **Hazard scan.** The NIOSH/USP 800 keyword scan runs on the SrLC change
+   text and the openFDA text. The **risk level comes from the SrLC change text
+   by default**. openFDA flags are still shown, labeled as context, and kept in
+   the QA file. The *Count openFDA text in risk level* toggle adds them to the
+   risk level. Keywords must start at a word boundary. Stems such as
+   `carcinogen` still match *carcinogenicity*. Short acronyms such as `ppe`,
+   `bsc`, `sds`, `cstd`, `n95`, `niosh`, and `usp 800` (plus `respirator`)
+   must match as whole words. Highlighting follows the same rule.
 6. **Review and export.** Record pharmacist decisions, then download:
    - the **report** (`.xlsx`: All Matches, High Risk, Action Required, P&T
      Summary), and
@@ -62,6 +71,11 @@ matched drug, and results are cached for 24 hours.
 
 The app runs fine without a key, and the key is never written to the exports.
 
+## Tests
+
+`python tests/test_core.py` runs offline checks of the keyword rule and the
+near-miss drug pairs.
+
 ## Data sources
 
 | Source | Used for | Access |
@@ -76,14 +90,10 @@ hours. The app waits about 0.4 seconds between FDA calls.
 
 ## Limitations
 
-- The hazard scan is keyword-based. openFDA's carcinogenesis and pregnancy
-  sections exist on almost every label, so with openFDA counted, most matches
-  score HIGH. Use the per-source risk columns, or turn off *Count openFDA text
-  in risk level*.
-- Some keywords also match inside other words (for example, `ppe` matches
-  "appear"). The scan is unchanged from the original app.
-- Matching keeps the top 5 SrLC rows per formulary drug, so a common generic
-  such as methotrexate can have more than 5 labels in range.
+- The hazard scan is keyword-based and doesn't read context, so phrases like
+  "no evidence of carcinogenicity" still trigger a flag. openFDA's
+  carcinogenesis and pregnancy sections exist on almost every label, which is
+  why openFDA text is left out of the risk level by default.
 - Some products, such as Thalomid, have no openFDA label. Their flags come
   from SrLC only.
 - FDA's Download Data CSV isn't strictly valid CSV, because it contains

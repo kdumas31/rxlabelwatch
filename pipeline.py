@@ -13,7 +13,9 @@ from typing import Callable
 import pandas as pd
 
 import fda_sources as fda
-from rxlw_core import autodetect_col, find_best_matches, normalize_drug_name, scan_for_hazards
+from rxlw_core import (
+    autodetect_col, find_best_matches, ingredient_agreement, normalize_drug_name, scan_for_hazards,
+)
 
 SRC_SRLC = "SrLC change text"
 SRC_SRLC_PAGE = "SrLC detail page (fallback)"
@@ -41,13 +43,17 @@ def run_matching(
     threshold: int = 78,
     extra_name_col: str | None = None,
     progress: Callable[[float, str], None] | None = None,
+    max_per_drug: int | None = None,
+    require_ingredient_agreement: bool = True,
 ) -> list[dict]:
     """Fuzzy-match formulary names to SrLC rows with find_best_matches.
 
     extra_name_col optionally matches a second SrLC column too (e.g. brand
     'Drug Name' in addition to 'Active Ingredient'); results are merged per
-    SrLC row (best score kept) and capped at 5 per formulary drug, the same
-    cap find_best_matches applies.
+    SrLC row (best score kept). max_per_drug=None keeps every SrLC row that
+    matches (the original app capped at 5). With require_ingredient_agreement,
+    a fuzzy hit must also pass ingredient_agreement (rejects look-alike
+    generics such as amoxicillin/oxacillin).
     """
     formulary_drugs = fdf[f_col].dropna().astype(str).unique().tolist()
     name_cols = [s_col] + ([extra_name_col] if extra_name_col and extra_name_col != s_col else [])
@@ -75,10 +81,14 @@ def run_matching(
             continue
         best: dict[int, tuple[int, str]] = {}
         for c in name_cols:
-            for idx, score in find_best_matches(drug_norm, norms_by_col[c], threshold=threshold):
+            for idx, score in find_best_matches(drug_norm, norms_by_col[c], threshold=threshold, limit=None):
+                if require_ingredient_agreement and not ingredient_agreement(drug_norm, norms_by_col[c][idx]):
+                    continue
                 if idx not in best or score > best[idx][0]:
                     best[idx] = (score, c)
-        ranked = sorted(best.items(), key=lambda kv: -kv[1][0])[:5]
+        ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
+        if max_per_drug:
+            ranked = ranked[:max_per_drug]
         for idx, (score, matched_col) in ranked:
             row = sdf.iloc[idx]
             url = cell(row, s_url_col)
@@ -126,7 +136,7 @@ def _flag_labels(findings: dict) -> list[str]:
     return labels
 
 
-def apply_scan(m: dict, include_openfda_in_risk: bool = True) -> None:
+def apply_scan(m: dict, include_openfda_in_risk: bool = False) -> None:
     """Run scan_for_hazards per source and on the combined text; record which
     source triggered each flag."""
     per_source = {}
@@ -145,6 +155,7 @@ def apply_scan(m: dict, include_openfda_in_risk: bool = True) -> None:
     m["usp800"] = combined["usp800"]
     m["boxed_warning"] = combined["boxed_warning"]
     m["risk_by_source"] = {src: f["risk_level"] for src, f in per_source.items()}
+    m["openfda_in_risk"] = include_openfda_in_risk
     flag_sources: dict[str, list[str]] = {}
     for src, f in per_source.items():
         for lab in _flag_labels(f):
@@ -159,7 +170,7 @@ def enrich_match(
     date_to: date | None = None,
     use_openfda: bool = True,
     api_key: str | None = None,
-    include_openfda_in_risk: bool = True,
+    include_openfda_in_risk: bool = False,
 ) -> dict:
     """Fill a match with SrLC change text (CSV), openFDA handling text, and flags."""
     f = fetchers or Fetchers()
@@ -233,7 +244,10 @@ def build_qa_workbook(slrc_df: pd.DataFrame | None, matches: list[dict], run_inf
             "Active Ingredient": m.get("active_ingredient", ""), "DrugNameID": m.get("drug_name_id", ""),
             "Overall Risk": m["risk_level"].upper(),
             "Risk by Source": "; ".join(f"{s}: {r.upper()}" for s, r in m.get("risk_by_source", {}).items()),
-            "Flags (source)": "; ".join(f"{lab} [{', '.join(srcs)}]" for lab, srcs in m.get("flag_sources", {}).items()),
+            "Flags (source)": "; ".join(
+                f"{lab} [{', '.join(s + ('' if m.get('openfda_in_risk') or s != SRC_OPENFDA else ' (context)') for s in srcs)}]"
+                for lab, srcs in m.get("flag_sources", {}).items()),
+            "openFDA Counted in Risk": "yes" if m.get("openfda_in_risk") else "no (context only)",
             "NIOSH Signals": _fmt_hits(m.get("niosh", {})), "USP 800 Signals": _fmt_hits(m.get("usp800", {})),
             "Boxed Warning": "YES" if m.get("boxed_warning") else "",
             "SrLC Text Source": m.get("text_source", ""), "SrLC Change Rows": len(m.get("srlc_records", [])),

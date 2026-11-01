@@ -153,7 +153,7 @@ def qa_download_button(key: str):
         data=data,
         file_name=f"rxlabelwatch_source_data_{datetime.now():%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
         key=key,
         help="SrLC results, the per-drug SrLC change text, and openFDA handling text for every match, with source URLs and fetch times.",
     )
@@ -174,7 +174,7 @@ def init_state():
         "s_type_col": None,
         "matches": None,
         "use_openfda": True,
-        "openfda_in_risk": True,
+        "openfda_in_risk": False,
         "ph_decisions": {},
         "ph_notes": {},
     }
@@ -243,7 +243,7 @@ if page == "1. Load Data":
         if st.session_state.formulary_df is not None:
             df = st.session_state.formulary_df
             st.success(f"Loaded **{len(df):,} rows**, {len(df.columns)} columns")
-            st.dataframe(df.head(8), use_container_width=True)
+            st.dataframe(df.head(8), width="stretch")
 
     with col2:
         st.markdown("### 📋 FDA Safety Labeling Changes (SrLC)")
@@ -263,7 +263,7 @@ if page == "1. Load Data":
                 key="srlc_dates",
                 help="Searches SrLC's Date Search across all label sections (boxed warning, contraindications, warnings & precautions, adverse reactions, drug interactions, specific populations, patient info).",
             )
-            if st.button("🔎 Fetch SrLC changes", type="primary", use_container_width=True, key="fetch_srlc"):
+            if st.button("🔎 Fetch SrLC changes", type="primary", width="stretch", key="fetch_srlc"):
                 if not isinstance(rng, (tuple, list)) or len(rng) != 2:
                     st.error("Pick both a start and an end date.")
                 else:
@@ -301,7 +301,7 @@ if page == "1. Load Data":
                 st.success(f"Fetched **{len(sdf):,} SrLC rows** for {r0:%m/%d/%Y} – {r1:%m/%d/%Y}")
             else:
                 st.success(f"Loaded **{len(sdf):,} rows**, {len(sdf.columns)} columns")
-            st.dataframe(sdf.drop(columns=[c for c in ("fetched_at", "source_url") if c in sdf.columns]).head(8), use_container_width=True)
+            st.dataframe(sdf.drop(columns=[c for c in ("fetched_at", "source_url") if c in sdf.columns]).head(8), width="stretch")
 
     if st.session_state.formulary_df is not None and st.session_state.slrc_df is not None:
         st.divider()
@@ -397,7 +397,14 @@ elif page == "2. Run Matching":
     st.session_state.openfda_in_risk = c2.toggle(
         "Count openFDA text in risk level",
         value=st.session_state.openfda_in_risk,
-        help="When off, the risk level reflects only the SrLC change text; openFDA hits are still listed by source.",
+        help="Off (default): risk comes from the SrLC change text only. openFDA hits are still shown as context, by source, and kept in the QA file. "
+             "Turning this on makes almost every drug HIGH, because nearly every label has carcinogenesis/pregnancy sections.",
+    )
+    default_cap = 0 if st.session_state.slrc_source == "fetch" else 5
+    max_per_drug = c1.number_input(
+        "Max SrLC labels per formulary drug (0 = no limit)",
+        min_value=0, max_value=500, value=default_cap, step=1,
+        help="0 keeps every label in range that matches (e.g. all methotrexate products). The original app kept the top 5.",
     )
 
     with st.expander("ℹ️ How matching works"):
@@ -414,7 +421,7 @@ For each match, the app downloads SrLC's per-drug **Download Data** CSV and keep
 then looks up the current label on **openFDA** (by application number, falling back to generic name). Each flag shows which source triggered it.
 """)
 
-    if st.button("▶ Run Matching", use_container_width=True, type="primary", key="run_matching"):
+    if st.button("▶ Run Matching", width="stretch", type="primary", key="run_matching"):
         fdf = st.session_state.formulary_df
         sdf = st.session_state.slrc_df
         f_col = st.session_state.f_name_col or fdf.columns[0]
@@ -428,6 +435,7 @@ then looks up the current label on **openFDA** (by application number, falling b
             threshold=threshold,
             extra_name_col=st.session_state.s_extra_name_col,
             progress=lambda p, t: progress.progress(p, text=t),
+            max_per_drug=int(max_per_drug) or None,
         )
         st.session_state.matches = matches
 
@@ -452,9 +460,11 @@ then looks up the current label on **openFDA** (by application number, falling b
             "Risk": m["risk_level"].upper(),
             "SrLC Risk": m.get("risk_by_source", {}).get(pl.SRC_SRLC, m.get("risk_by_source", {}).get(pl.SRC_SRLC_PAGE, "")).upper(),
             "openFDA Risk": m.get("risk_by_source", {}).get(pl.SRC_OPENFDA, "").upper(),
-            "Flags (source)": "; ".join(f"{lab} [{', '.join(s.split(' ')[0] for s in srcs)}]" for lab, srcs in m.get("flag_sources", {}).items()),
+            "Flags (source)": "; ".join(
+                f"{lab} [{', '.join(s.split(' ')[0] + ('' if m.get('openfda_in_risk') or s != pl.SRC_OPENFDA else ' (context)') for s in srcs)}]"
+                for lab, srcs in m.get("flag_sources", {}).items()),
         } for m in matches])
-        st.dataframe(preview, use_container_width=True)
+        st.dataframe(preview, width="stretch")
         qa_download_button("qa_dl_page2")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -532,8 +542,10 @@ elif page == "3. Hazard Review":
             if tags:
                 st.markdown(tags + "<br>", unsafe_allow_html=True)
             if match.get("flag_sources"):
+                ctx = "" if st.session_state.openfda_in_risk else " (context, not in risk level)"
                 st.markdown("**Flag sources:** " + " · ".join(
-                    f"{lab} — _{', '.join(srcs)}_" for lab, srcs in match["flag_sources"].items()))
+                    f"{lab} — _{', '.join(s + (ctx if s == pl.SRC_OPENFDA else '') for s in srcs)}_"
+                    for lab, srcs in match["flag_sources"].items()))
             if match.get("risk_by_source"):
                 st.caption("Risk by source: " + " · ".join(f"{s}: {r.upper()}" for s, r in match["risk_by_source"].items()))
 
@@ -584,7 +596,7 @@ elif page == "3. Hazard Review":
                     height=110,
                     key=f"notes_{wkey}",
                 )
-                if st.button("Save Review", key=f"save_{wkey}", use_container_width=True):
+                if st.button("Save Review", key=f"save_{wkey}", width="stretch"):
                     if decision:
                         st.session_state.ph_decisions[drug] = decision
                     if notes:
@@ -727,7 +739,7 @@ elif page == "4. Export":
         data=output,
         file_name=f"rxlabelwatch_{date_str}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
         type="primary",
     )
     qa_download_button("qa_dl_page4")
@@ -743,4 +755,4 @@ elif page == "4. Export":
         "Boxed Warning": "YES" if m.get("boxed_warning") else "",
         "Decision": st.session_state.ph_decisions.get(m["formulary_drug"], "—"),
     } for m in matches])
-    st.dataframe(prev_df, use_container_width=True)
+    st.dataframe(prev_df, width="stretch")

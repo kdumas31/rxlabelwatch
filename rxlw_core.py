@@ -122,7 +122,7 @@ def normalize_drug_name(name: str) -> str:
     return n
 
 # ─── Fuzzy Matching ────────────────────────────────────────────────────────────
-def find_best_matches(formulary_norm: str, slrc_norms: list, threshold: int = 78):
+def find_best_matches(formulary_norm: str, slrc_norms: list, threshold: int = 78, limit: int | None = 5):
     results = []
     for i, norm in enumerate(slrc_norms):
         if not norm:
@@ -131,7 +131,76 @@ def find_best_matches(formulary_norm: str, slrc_norms: list, threshold: int = 78
         if score >= threshold:
             results.append((i, score))
     results.sort(key=lambda x: -x[1])
-    return results[:5]
+    return results if limit is None else results[:limit]
+
+
+def ingredient_agreement(a_norm: str, b_norm: str, token_threshold: int = 95) -> bool:
+    """Ingredient-level check on top of the fuzzy score.
+
+    Every word of the shorter normalized name must appear in the other name,
+    exactly or as a near-identical spelling (fuzz.ratio >= token_threshold,
+    e.g. cyclosporin/cyclosporine = 96). This rejects look-alike generics that
+    share a USAN stem, which token_sort_ratio scores highly:
+    amoxicillin/oxacillin = 80, prednisone/prednisolone = 91.
+    """
+    a, b = a_norm.split(), b_norm.split()
+    if not a or not b:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return all(
+        any(tok == other or fuzz.ratio(tok, other) >= token_threshold for other in long_)
+        for tok in short
+    )
+
+# ─── Keyword matching rule ─────────────────────────────────────────────────────
+# Every keyword must start at a word boundary, so "tumor" no longer hits
+# "pseudotumor" and "ames test" no longer hits "names test".
+# Most keywords are stems and may continue ("carcinogen" -> carcinogenic,
+# carcinogenicity; "double glov" -> gloves/gloving; "incinerat" -> incineration).
+# Short acronyms and words whose stem would hit an unrelated word are WHOLE
+# words (optional plural s), so "ppe" no longer hits "happen"/"appear",
+# "bsc"/"sds" can't fire inside other words, and "respirator" no longer hits
+# "respiratory".
+WHOLE_WORD_KEYWORDS = {
+    "ppe", "bsc", "sds", "cstd", "n95", "niosh", "usp 800", "usp800",
+    "respirator",
+}
+
+HIGH_SIGNALS = [
+    "carcinogen", "genotoxic", "teratogenic", "antineoplastic", "cytotoxic",
+    "hazardous drug", "niosh", "usp 800", "closed system", "cstd",
+    "embryo-fetal", "myelosuppression",
+]
+MEDIUM_SIGNALS = [
+    "reproductive toxicity", "organ toxicity", "hepatotoxic", "nephrotoxic",
+    "ppe", "personal protective equipment", "disposal precaution",
+    "handling precaution", "pregnancy", "lactation", "mutagenic",
+]
+
+_PATTERN_CACHE: dict[str, re.Pattern] = {}
+
+
+def keyword_regex(kw: str) -> str:
+    """Regex source for one keyword under the start-of-word / whole-word rule."""
+    k = kw.lower()
+    body = re.escape(k.rstrip("\n").strip()) if k.endswith("\n") else re.escape(k)
+    if k.endswith("\n"):           # boxed-warning heading phrases like "WARNING\n"
+        return r"\b" + body + r"\n"
+    if k in WHOLE_WORD_KEYWORDS:
+        return r"\b" + body + r"(?:s|es)?\b"
+    return r"\b" + body
+
+
+def keyword_pattern(kw: str) -> re.Pattern:
+    p = _PATTERN_CACHE.get(kw)
+    if p is None:
+        p = _PATTERN_CACHE[kw] = re.compile(keyword_regex(kw), re.IGNORECASE)
+    return p
+
+
+def keyword_in(kw: str, text: str) -> bool:
+    return keyword_pattern(kw).search(text) is not None
+
 
 # ─── Hazard Analysis ───────────────────────────────────────────────────────────
 def scan_for_hazards(text: str) -> dict:
@@ -140,28 +209,18 @@ def scan_for_hazards(text: str) -> dict:
     t = text.lower()
     niosh_hits = {}
     for category, keywords in NIOSH_CRITERIA.items():
-        hits = [kw for kw in keywords if kw.lower() in t]
+        hits = [kw for kw in keywords if keyword_in(kw, t)]
         if hits:
             niosh_hits[category] = hits
     usp800_hits = {}
     for category, keywords in USP800_CRITERIA.items():
-        hits = [kw for kw in keywords if kw.lower() in t]
+        hits = [kw for kw in keywords if keyword_in(kw, t)]
         if hits:
             usp800_hits[category] = hits
-    boxed = any(p.lower() in t for p in BOXED_WARNING_PHRASES)
-    high_signals = [
-        "carcinogen", "genotoxic", "teratogenic", "antineoplastic", "cytotoxic",
-        "hazardous drug", "niosh", "usp 800", "closed system", "cstd",
-        "embryo-fetal", "myelosuppression",
-    ]
-    medium_signals = [
-        "reproductive toxicity", "organ toxicity", "hepatotoxic", "nephrotoxic",
-        "ppe", "personal protective equipment", "disposal precaution",
-        "handling precaution", "pregnancy", "lactation", "mutagenic",
-    ]
-    if boxed or any(s in t for s in high_signals):
+    boxed = any(keyword_in(p, t) for p in BOXED_WARNING_PHRASES)
+    if boxed or any(keyword_in(s, t) for s in HIGH_SIGNALS):
         risk = "high"
-    elif any(s in t for s in medium_signals):
+    elif any(keyword_in(s, t) for s in MEDIUM_SIGNALS):
         risk = "medium"
     elif niosh_hits or usp800_hits:
         risk = "low"
@@ -169,28 +228,31 @@ def scan_for_hazards(text: str) -> dict:
         risk = "none"
     return {"niosh": niosh_hits, "usp800": usp800_hits, "boxed_warning": boxed, "risk_level": risk}
 
-def highlight_keywords(raw_text: str) -> str:
-    escaped = html.escape(raw_text)
-    all_kw = []
+
+def _highlight_regex():
+    css_for = {}
     for kws in NIOSH_CRITERIA.values():
         for kw in kws:
-            all_kw.append((kw, "hl-niosh"))
+            css_for.setdefault(kw.lower(), "hl-niosh")
     for kws in USP800_CRITERIA.values():
         for kw in kws:
-            all_kw.append((kw, "hl-usp800"))
-    all_kw.sort(key=lambda x: -len(x[0]))
-    seen = set()
-    for kw, css in all_kw:
-        if kw.lower() in seen:
-            continue
-        pattern = re.compile(re.escape(kw), re.IGNORECASE)
-        if pattern.search(escaped):
-            escaped = pattern.sub(
-                lambda m: f'<span class="{css}">{m.group()}</span>',
-                escaped,
-            )
-            seen.add(kw.lower())
-    return escaped
+            css_for.setdefault(kw.lower(), "hl-usp800")
+    ordered = sorted(css_for, key=len, reverse=True)  # longest first
+    groups = "|".join(f"(?P<k{i}>{keyword_regex(kw)})" for i, kw in enumerate(ordered))
+    return re.compile(groups, re.IGNORECASE), {f"k{i}": css_for[kw] for i, kw in enumerate(ordered)}
+
+
+_HL_RE, _HL_CSS = _highlight_regex()
+
+
+def highlight_keywords(raw_text: str) -> str:
+    """Same matching rule as scan_for_hazards; one pass over the escaped text so
+    a keyword can never match inside an inserted <span> tag."""
+    escaped = html.escape(raw_text)
+    return _HL_RE.sub(
+        lambda m: f'<span class="{_HL_CSS[m.lastgroup]}">{m.group()}</span>',
+        escaped,
+    )
 
 # ─── Column Auto-Detect ────────────────────────────────────────────────────────
 def autodetect_col(df: pd.DataFrame, keywords: list[str]) -> str | None:
